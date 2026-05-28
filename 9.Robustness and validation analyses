@@ -1,0 +1,571 @@
+
+!pip -q install catboost
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# ============================================================
+# 0. Config
+# ============================================================
+
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST.npz"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/current_model_uncertainty_checks/step1_3_randomsplit_mainmodel"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+
+FINAL_FEATURES = [
+    "DEM.DEM",
+    "ERA5LMAIN.SSRD",
+    "ERA5LMAIN.TP",
+    "ERA5LMAIN.VPD",
+    "EVI.EVI",
+    "LAI.LAI",
+    "MODIS.LC",
+    "NTL.NTL",
+]
+
+VEG_FEATURES = ["EVI.EVI", "LAI.LAI"]
+
+TEST_SIZE = 0.20
+
+# Permutation settings
+N_REPEATS = 3
+TEST_MAX_N = 400_000
+RIDGE_ALPHA = 1.0
+
+# Main-model-consistent CatBoost settings
+CB_PARAMS_GPU = dict(
+    iterations=10000,
+    depth=8,
+    learning_rate=0.1,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    task_type="GPU",
+    devices="0",
+    od_type="Iter",
+    od_wait=200,
+    verbose=200
+)
+
+CB_PARAMS_CPU = dict(
+    iterations=3000,
+    depth=8,
+    learning_rate=0.03,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=200,
+    verbose=200
+)
+
+# ============================================================
+# 1. Load current final matrix
+# ============================================================
+
+npz = np.load(NPZ_PATH, allow_pickle=True)
+
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+print(f"Loaded raw: X={X_raw.shape}, y={y_raw.shape}, n_channels={len(channels_raw)}")
+print("Raw channels:", channels_raw)
+
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+
+# city id is only used for diagnostics, not split
+if "sample_city_id" in npz.files:
+    city_id = npz["sample_city_id"][mask].astype(np.int32)
+    city_source = "sample_city_id"
+elif "META.CITY_ID" in channels_raw:
+    city_idx = channels_raw.index("META.CITY_ID")
+    city_id = X_raw[:, city_idx].astype(np.int32)
+    city_source = "META.CITY_ID"
+else:
+    city_id = None
+    city_source = "not found"
+
+# keep only final features, in final model order
+keep_idx = []
+missing = []
+
+for ch in FINAL_FEATURES:
+    if ch in channels_raw:
+        keep_idx.append(channels_raw.index(ch))
+    else:
+        missing.append(ch)
+
+if missing:
+    raise ValueError(f"Missing final features in NPZ: {missing}")
+
+X = X_raw[:, keep_idx].astype(np.float32)
+channels = FINAL_FEATURES.copy()
+
+print(f"After y finite mask and final-feature selection: X={X.shape}, y={y.shape}")
+print("Final features:", channels)
+
+if city_id is not None:
+    print(f"City id source: {city_source} | unique cities={len(np.unique(city_id))}")
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+def metrics(y_true, y_pred):
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+def idx_of(name):
+    if name not in channels:
+        raise ValueError(f"{name} not found in final features.")
+    return channels.index(name)
+
+evi_i = idx_of("EVI.EVI")
+lai_i = idx_of("LAI.LAI")
+
+def pearson(a, b):
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+
+    m = np.isfinite(a) & np.isfinite(b)
+    a = a[m]
+    b = b[m]
+
+    if len(a) < 3:
+        return np.nan
+
+    a = a - a.mean()
+    b = b - b.mean()
+
+    denom = np.sqrt((a * a).sum() * (b * b).sum()) + 1e-12
+    return float((a * b).sum() / denom)
+
+def spearman(a, b):
+    a = np.asarray(a)
+    b = np.asarray(b)
+
+    m = np.isfinite(a) & np.isfinite(b)
+    a = a[m]
+    b = b[m]
+
+    if len(a) < 3:
+        return np.nan
+
+    ra = a.argsort().argsort().astype(np.float64)
+    rb = b.argsort().argsort().astype(np.float64)
+
+    return pearson(ra, rb)
+
+def fit_catboost(Xtr, ytr, Xva, yva, feat_names):
+    train_pool = Pool(Xtr, ytr, feature_names=feat_names)
+    val_pool = Pool(Xva, yva, feature_names=feat_names)
+
+    try:
+        model = CatBoostRegressor(**CB_PARAMS_GPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        used_gpu = True
+    except Exception as e:
+        print("[WARN] GPU failed, CPU fallback:", repr(e))
+        model = CatBoostRegressor(**CB_PARAMS_CPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        used_gpu = False
+
+    return model, used_gpu
+
+def ridge_fit_residual(X_other, x_target, alpha=1.0):
+    """
+    Fit ridge:
+        x_target ≈ X_other @ w + b
+    Return:
+        residuals and fitted values.
+
+    This keeps the original conditional-residual permutation idea.
+    """
+    Xo = X_other.astype(np.float64)
+    xt = x_target.astype(np.float64)
+
+    # Safety for rare non-finite values
+    if not np.isfinite(Xo).all():
+        col_med = np.nanmedian(Xo, axis=0)
+        inds = np.where(~np.isfinite(Xo))
+        Xo[inds] = np.take(col_med, inds[1])
+
+    if not np.isfinite(xt).all():
+        med = np.nanmedian(xt)
+        xt[~np.isfinite(xt)] = med
+
+    ones = np.ones((Xo.shape[0], 1), dtype=np.float64)
+    A = np.hstack([Xo, ones])
+
+    p = A.shape[1]
+    I = np.eye(p, dtype=np.float64)
+    I[-1, -1] = 0.0  # do not penalize intercept
+
+    ATA = A.T @ A
+    rhs = A.T @ xt
+
+    w = np.linalg.solve(ATA + alpha * I, rhs)
+
+    xhat = A @ w
+    resid = xt - xhat
+
+    return resid.astype(np.float32), xhat.astype(np.float32)
+
+# ============================================================
+# 3. Random train/test split consistent with main model
+# ============================================================
+
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_SEED
+)
+
+print(f"[Split=random] train={X_tr.shape}, test={X_te.shape}")
+
+# permutation subset for speed
+rng = np.random.default_rng(RANDOM_SEED)
+
+if X_te.shape[0] > TEST_MAX_N:
+    take = rng.choice(X_te.shape[0], size=TEST_MAX_N, replace=False)
+    X_te_pi = X_te[take]
+    y_te_pi = y_te[take]
+else:
+    X_te_pi = X_te
+    y_te_pi = y_te
+
+print(f"[Permutation subset] test_n={X_te_pi.shape[0]} (cap={TEST_MAX_N})")
+
+# ============================================================
+# STEP 1. EVI–LAI correlation structure
+# ============================================================
+
+EVI = X[:, evi_i]
+LAI = X[:, lai_i]
+
+m = np.isfinite(EVI) & np.isfinite(LAI)
+EVI_m = EVI[m]
+LAI_m = LAI[m]
+
+r_global = pearson(EVI_m, LAI_m)
+rho_global = spearman(EVI_m, LAI_m)
+
+step1 = {
+    "global": {
+        "pearson_r": float(r_global),
+        "spearman_rho": float(rho_global),
+        "n": int(EVI_m.size),
+    }
+}
+
+if city_id is not None:
+    city_m = city_id[m]
+    per_city = {}
+
+    for cid in np.unique(city_m):
+        idx = city_m == cid
+        if idx.sum() < 3000:
+            continue
+        per_city[int(cid)] = pearson(EVI_m[idx], LAI_m[idx])
+
+    per_city_vals = np.array(list(per_city.values()), dtype=float)
+
+    step1["per_city"] = {
+        "n_cities": int(per_city_vals.size),
+        "pearson_r_median": float(np.nanmedian(per_city_vals)) if per_city_vals.size else None,
+        "pearson_r_p25": float(np.nanpercentile(per_city_vals, 25)) if per_city_vals.size else None,
+        "pearson_r_p75": float(np.nanpercentile(per_city_vals, 75)) if per_city_vals.size else None,
+    }
+else:
+    per_city_vals = np.array([], dtype=float)
+
+print("\n=== Step 1: EVI–LAI correlation ===")
+print(json.dumps(step1, indent=2))
+
+# Plot 1: hexbin
+plt.figure(figsize=(7, 6))
+hb = plt.hexbin(EVI_m, LAI_m, gridsize=70, bins="log")
+plt.colorbar(hb, label="Counts")
+plt.title("Correlation between EVI and LAI")
+plt.xlabel("EVI")
+plt.ylabel("LAI")
+plt.text(
+    0.02,
+    0.95,
+    f"Pearson r = {r_global:.2f}\nSpearman ρ = {rho_global:.2f}",
+    transform=plt.gca().transAxes,
+    ha="left",
+    va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.9)
+)
+fig1 = os.path.join(OUT_DIR, "step1_evi_lai_hexbin.png")
+plt.tight_layout()
+plt.savefig(fig1, dpi=200, bbox_inches="tight")
+plt.show()
+
+# Plot 2: citywise correlation distribution
+if per_city_vals.size > 0:
+    plt.figure(figsize=(7, 4))
+    plt.hist(per_city_vals, bins=30, alpha=0.9)
+    plt.title("Distribution of EVI–LAI Pearson r across cities")
+    plt.xlabel("Pearson r within city")
+    plt.ylabel("City count")
+    fig1b = os.path.join(OUT_DIR, "step1_citywise_corr_hist.png")
+    plt.tight_layout()
+    plt.savefig(fig1b, dpi=200, bbox_inches="tight")
+    plt.show()
+else:
+    fig1b = None
+
+with open(os.path.join(OUT_DIR, "step1_corr_structure.json"), "w") as f:
+    json.dump(step1, f, indent=2)
+
+print("[Step1] Saved:")
+print(fig1)
+if fig1b is not None:
+    print(fig1b)
+print(os.path.join(OUT_DIR, "step1_corr_structure.json"))
+
+# ============================================================
+# STEP 2. Drop-group retrain: baseline vs drop EVI+LAI
+# ============================================================
+
+print("\n=== Step 2: Baseline model ===")
+
+model_base, used_gpu_base = fit_catboost(
+    X_tr,
+    y_tr,
+    X_te,
+    y_te,
+    channels
+)
+
+pred_base = model_base.predict(X_te)
+m_base = metrics(y_te, pred_base)
+
+print(f"[Step2][Baseline] used_gpu={used_gpu_base} | {m_base}")
+
+print("\n=== Step 2: Drop EVI + LAI model ===")
+
+drop_idx = [evi_i, lai_i]
+keep2 = [i for i in range(len(channels)) if i not in drop_idx]
+
+X_tr2 = X_tr[:, keep2]
+X_te2 = X_te[:, keep2]
+channels2 = [channels[i] for i in keep2]
+
+model_drop, used_gpu_drop = fit_catboost(
+    X_tr2,
+    y_tr,
+    X_te2,
+    y_te,
+    channels2
+)
+
+pred_drop = model_drop.predict(X_te2)
+m_drop = metrics(y_te, pred_drop)
+
+print(f"[Step2][Drop EVI+LAI] used_gpu={used_gpu_drop} | {m_drop}")
+
+step2 = {
+    "split_mode": "random_80_20",
+    "train_n": int(X_tr.shape[0]),
+    "test_n": int(X_te.shape[0]),
+    "baseline": {
+        "metrics": m_base,
+        "used_gpu": bool(used_gpu_base),
+        "n_features": int(len(channels)),
+        "features": channels,
+    },
+    "drop_EVI_LAI": {
+        "metrics": m_drop,
+        "used_gpu": bool(used_gpu_drop),
+        "n_features": int(len(channels2)),
+        "features": channels2,
+    },
+    "delta_drop_minus_baseline": {
+        "delta_rmse": float(m_drop["rmse"] - m_base["rmse"]),
+        "delta_mae": float(m_drop["mae"] - m_base["mae"]),
+        "delta_r2": float(m_drop["r2"] - m_base["r2"]),
+    }
+}
+
+step2_fp = os.path.join(OUT_DIR, "step2_drop_group_summary.json")
+with open(step2_fp, "w") as f:
+    json.dump(step2, f, indent=2)
+
+print("[Step2] Saved:")
+print(step2_fp)
+
+# ============================================================
+# STEP 3. Naive vs conditional permutation importance
+# ============================================================
+
+print("\n=== Step 3: Naive vs conditional permutation importance ===")
+
+pred0 = model_base.predict(X_te_pi)
+rmse0 = mean_squared_error(y_te_pi, pred0) ** 0.5
+
+print(f"Baseline RMSE on permutation subset: {rmse0:.4f}")
+
+def permute_naive_delta_rmse(model, Xtest, ytest, j, rmse_base, repeats=3, seed=0):
+    rng = np.random.default_rng(seed)
+    deltas = []
+
+    for r in range(repeats):
+        Xp = Xtest.copy()
+        rng.shuffle(Xp[:, j])
+        p = model.predict(Xp)
+        rmse = mean_squared_error(ytest, p) ** 0.5
+        deltas.append(rmse - rmse_base)
+
+    return float(np.mean(deltas)), float(np.std(deltas))
+
+def permute_conditional_delta_rmse(model, Xtest, ytest, j, rmse_base, alpha=1.0, repeats=3, seed=0):
+    rng = np.random.default_rng(seed)
+
+    others = [k for k in range(Xtest.shape[1]) if k != j]
+    Xo = Xtest[:, others]
+    xj = Xtest[:, j]
+
+    resid, xhat = ridge_fit_residual(Xo, xj, alpha=alpha)
+
+    deltas = []
+
+    for r in range(repeats):
+        Xp = Xtest.copy()
+        rp = resid.copy()
+        rng.shuffle(rp)
+        Xp[:, j] = xhat + rp
+        p = model.predict(Xp)
+        rmse = mean_squared_error(ytest, p) ** 0.5
+        deltas.append(rmse - rmse_base)
+
+    return float(np.mean(deltas)), float(np.std(deltas))
+
+step3 = {
+    "split_mode": "random_80_20",
+    "rmse0": float(rmse0),
+    "n_test_perm": int(X_te_pi.shape[0]),
+    "alpha": float(RIDGE_ALPHA),
+    "repeats": int(N_REPEATS),
+    "features": {}
+}
+
+for name, j in [("EVI.EVI", evi_i), ("LAI.LAI", lai_i)]:
+    m_na, s_na = permute_naive_delta_rmse(
+        model_base,
+        X_te_pi,
+        y_te_pi,
+        j,
+        rmse_base=rmse0,
+        repeats=N_REPEATS,
+        seed=RANDOM_SEED + 11
+    )
+
+    m_co, s_co = permute_conditional_delta_rmse(
+        model_base,
+        X_te_pi,
+        y_te_pi,
+        j,
+        rmse_base=rmse0,
+        alpha=RIDGE_ALPHA,
+        repeats=N_REPEATS,
+        seed=RANDOM_SEED + 23
+    )
+
+    step3["features"][name] = {
+        "naive_mean_delta_rmse": float(m_na),
+        "naive_std_delta_rmse": float(s_na),
+        "conditional_mean_delta_rmse": float(m_co),
+        "conditional_std_delta_rmse": float(s_co)
+    }
+
+    print(f"[Step3] {name}")
+    print(f"  naive:       {m_na:.4f} ± {s_na:.4f}")
+    print(f"  conditional: {m_co:.4f} ± {s_co:.4f}")
+
+# Plot permutation result
+labels = list(step3["features"].keys())
+naive = [step3["features"][k]["naive_mean_delta_rmse"] for k in labels]
+cond = [step3["features"][k]["conditional_mean_delta_rmse"] for k in labels]
+
+naive_err = [step3["features"][k]["naive_std_delta_rmse"] for k in labels]
+cond_err = [step3["features"][k]["conditional_std_delta_rmse"] for k in labels]
+
+x = np.arange(len(labels))
+w = 0.38
+
+plt.figure(figsize=(7.2, 4.8))
+plt.bar(x - w / 2, naive, width=w, yerr=naive_err, capsize=3, label="Naive permutation")
+plt.bar(x + w / 2, cond, width=w, yerr=cond_err, capsize=3, label="Conditional residual permutation")
+plt.xticks(x, labels)
+plt.ylabel("ΔRMSE on random holdout test")
+plt.title("Permutation importance: naive vs conditional")
+plt.axhline(0, color="gray", linestyle=":", linewidth=1)
+plt.legend(frameon=False)
+plt.tight_layout()
+
+fig3 = os.path.join(OUT_DIR, "step3_perm_importance_naive_vs_cond.png")
+plt.savefig(fig3, dpi=220, bbox_inches="tight")
+plt.show()
+
+step3_fp = os.path.join(OUT_DIR, "step3_perm_importance_EVI_LAI.json")
+with open(step3_fp, "w") as f:
+    json.dump(step3, f, indent=2)
+
+print("[Step3] Saved:")
+print(fig3)
+print(step3_fp)
+
+# ============================================================
+# 4. Final report
+# ============================================================
+
+report = {
+    "npz_path": NPZ_PATH,
+    "out_dir": OUT_DIR,
+    "random_seed": RANDOM_SEED,
+    "final_features": FINAL_FEATURES,
+    "split_mode": "random_80_20",
+    "test_size": TEST_SIZE,
+    "catboost_gpu_params": CB_PARAMS_GPU,
+    "catboost_cpu_params": CB_PARAMS_CPU,
+    "step1": step1,
+    "step2": step2,
+    "step3": step3,
+}
+
+report_fp = os.path.join(OUT_DIR, "current_model_step1_3_uncertainty_report.json")
+with open(report_fp, "w") as f:
+    json.dump(report, f, indent=2)
+
+print("\n============================================================")
+print("DONE: Current-model Step1–3 uncertainty checks finished.")
+print("============================================================")
+print("Outputs in:", OUT_DIR)
+print("Report:", report_fp)
+
+print("\nKey numbers:")
+print("Baseline:", m_base)
+print("Drop EVI+LAI:", m_drop)
+print("Delta drop - baseline:", step2["delta_drop_minus_baseline"])
+print("Permutation:", json.dumps(step3["features"], indent=2))
