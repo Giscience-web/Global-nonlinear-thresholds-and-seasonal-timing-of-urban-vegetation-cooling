@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from catboost import CatBoostRegressor
 
 # ============================================================
+# ！！！！！Before running, please place the trained model in the /content/drive/MyDrive/anature_revised/Trainmodel/ path.
 # 0) Paths
 # ============================================================
 MODEL_DIR = "/content/drive/MyDrive/anature_revised/Trainmodel/"
