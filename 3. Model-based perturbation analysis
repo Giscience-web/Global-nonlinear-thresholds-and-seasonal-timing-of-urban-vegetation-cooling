@@ -1,430 +1,631 @@
-# -*- coding: utf-8 -*-
-import os, json, gc
+
+# ============================================================
+# ！！！！！Before running, please place the trained model in the /content/drive/MyDrive/anature_revised/Trainmodel/ path.
+# ============================================================
+# Dependencies
+# ============================================================
+# !pip -q install catboost
+
+import os
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from catboost import CatBoostRegressor
 
-# ============================================================
-# ！！！！！Before running, please place the trained model in the /content/drive/MyDrive/anature_revised/Trainmodel/ path.
-# 0) Paths
-# ============================================================
-MODEL_DIR = "/content/drive/MyDrive/anature_revised/Trainmodel/"
-
-model_path    = os.path.join(MODEL_DIR, "catboost_model.cbm")
-channels_path = os.path.join(MODEL_DIR, "channels.npy")
-X_valid_path  = os.path.join(MODEL_DIR, "X_valid.npy")
-y_valid_path  = os.path.join(MODEL_DIR, "y_valid.npy")
-
-OUT_DIR = os.path.join(MODEL_DIR, "veg_sensitivity_fast_dual_baseline")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-assert os.path.exists(model_path)
-assert os.path.exists(channels_path)
-assert os.path.exists(X_valid_path)
-assert os.path.exists(y_valid_path)
 
 # ============================================================
-# 1) Load
+# User settings
 # ============================================================
+
+MODEL_DIR = "/content/drive/MyDrive/anature_revised/Trainmodel/"  # ← 改成你的模型目录
+
+# ---------- speed settings ----------
+MAX_SAMPLES_PER_SUBSET = 100000   # 调试可改 20000 / 50000；正式建议 100000
+MAX_DELTA_POINTS = 51            # 按你原来的画法保留 201 个点
+PCT_STEP = 0.02                   # 按你原来的 1% mean_pos
+Q_HI = 0.95
+RANDOM_STATE = 42
+
+# ---------- uncertainty settings ----------
+N_BOOTSTRAP = 200                 # 调试可改 100
+BOOTSTRAP_SAMPLE_SIZE = 10000     # 每次 bootstrap 抽样量，越大越稳但越慢
+CI_LEVEL = 95
+
+# ---------- EVI x-axis setting ----------
+EVI_XMAX = 0.60                   # EVI 的 Δ 横轴延伸到 0.6
+
+# ---------- output ----------
+OUT_JSON_NAME = "veg_sensitivity_positive_1pct_withCI_extendEVI06.json"
+OUT_FIG_NAME = "veg_sensitivity_positive_1pct_withCI_extendEVI06.png"
+
+
+# ============================================================
+# Paths
+# ============================================================
+
+model_path     = os.path.join(MODEL_DIR, "catboost_model.cbm")
+channels_path  = os.path.join(MODEL_DIR, "channels.npy")
+X_valid_path   = os.path.join(MODEL_DIR, "X_valid.npy")
+y_valid_path   = os.path.join(MODEL_DIR, "y_valid.npy")
+
+assert os.path.exists(model_path), f"未找到模型: {model_path}"
+assert os.path.exists(channels_path), f"未找到特征文件: {channels_path}"
+assert os.path.exists(X_valid_path), f"未找到 X_valid: {X_valid_path}"
+assert os.path.exists(y_valid_path), f"未找到 y_valid: {y_valid_path}"
+
+
+# ============================================================
+# Load model and validation data
+# ============================================================
+
+print("Loading model and validation data...")
+
 model = CatBoostRegressor()
 model.load_model(model_path)
 
 channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
-X_valid = np.load(X_valid_path).astype(np.float32)
+X_valid = np.load(X_valid_path)
 y_valid = np.load(y_valid_path).astype(np.float32)
 
 Xv = pd.DataFrame(X_valid, columns=channels)
 
+print("X_valid shape:", Xv.shape)
+print("y_valid shape:", y_valid.shape)
+print("Number of features:", len(channels))
+
+
+# ============================================================
+# Vegetation features
+# ============================================================
+
 veg_features = [f for f in ["EVI.EVI", "LAI.LAI"] if f in Xv.columns]
-assert veg_features, "No EVI.EVI / LAI.LAI in validation features."
+
+assert veg_features, (
+    "验证集未包含 EVI.EVI 或 LAI.LAI。"
+    f"当前列名为: {Xv.columns.tolist()}"
+)
+
+print("Vegetation features used:", veg_features)
+
 
 # ============================================================
-# 2) Settings
+# Clean EVI / LAI
 # ============================================================
-RANDOM_SEED = 42
 
-# Speed knobs
-MAX_SAMPLES_PER_SUBSET = 80000     # final可设 100000-200000；测试设 20000
-PREDICT_BATCH_DELTAS = 8           # 每次同时预测几个delta，太大容易爆内存
-BOOTSTRAP_N = 500                  # 由于不再重复预测，可以提高到500/1000
-CI_LEVEL = 95
-BOOTSTRAP_CHUNK = 50               # bootstrap分块，避免一次生成巨大idx矩阵
+def sanitize_veg(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean vegetation variables:
+    - non-finite values -> 0
+    - EVI clipped to [0, 1]
+    - LAI clipped to [0, 8]
+    """
+    if "EVI.EVI" in df.columns:
+        x = df["EVI.EVI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 1.0)
+        df["EVI.EVI"] = x.astype(np.float32)
 
-# Perturbation range
-DELTA_MAX_POINTS = 201
-PCT_STEP = 0.01
-Q_HI = 0.95
+    if "LAI.LAI" in df.columns:
+        x = df["LAI.LAI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 8.0)
+        df["LAI.LAI"] = x.astype(np.float32)
 
-# Optional empirical cap
-EVI_MIN, EVI_MAX = 0.0, 1.0
-LAI_MIN, LAI_MAX = 0.0, 8.0
+    return df
 
-# Subsets
-q80 = np.nanquantile(y_valid, 0.80)
-q60 = np.nanquantile(y_valid, 0.60)
+
+Xv = sanitize_veg(Xv)
+
+
+# ============================================================
+# Temperature subset partition
+# ============================================================
+
+q80 = np.quantile(y_valid, 0.80)
+q60 = np.quantile(y_valid, 0.60)
+
+idx_all  = np.ones_like(y_valid, dtype=bool)
+idx_high = y_valid >= q80
+idx_mid  = (y_valid < q80) & (y_valid >= q60)
 
 subsets = {
-    "All": np.ones_like(y_valid, dtype=bool),
-    "High Temp (>=P80)": y_valid >= q80,
-    "Mid Temp ([P60,P80))": (y_valid < q80) & (y_valid >= q60),
+    "All": idx_all,
+    "High Temp (≥P80)": idx_high,
+    "Mid Temp ([P60,P80))": idx_mid
 }
 
-style_map = {
-    "All": dict(color="black", linewidth=2.5, linestyle="-"),
-    "High Temp (>=P80)": dict(color="#d62728", linewidth=2.0, linestyle="--"),
-    "Mid Temp ([P60,P80))": dict(color="#1f77b4", linewidth=2.0, linestyle="-."),
-}
+print("\nTemperature thresholds:")
+print(f"  P60 = {q60:.3f}")
+print(f"  P80 = {q80:.3f}")
 
-rng_global = np.random.default_rng(RANDOM_SEED)
+print("\nSubset sizes:")
+for name, mask in subsets.items():
+    print(f"  {name}: {int(mask.sum())}")
+
 
 # ============================================================
-# 3) Utilities
+# Utility functions
 # ============================================================
-def sanitize_veg_np(X, cols):
-    X = X.copy()
-    if "EVI.EVI" in cols:
-        j = cols.index("EVI.EVI")
-        x = X[:, j]
-        x = np.nan_to_num(x, nan=0.0)
-        X[:, j] = np.clip(x, EVI_MIN, EVI_MAX)
-    if "LAI.LAI" in cols:
-        j = cols.index("LAI.LAI")
-        x = X[:, j]
-        x = np.nan_to_num(x, nan=0.0)
-        X[:, j] = np.clip(x, LAI_MIN, LAI_MAX)
-    return X.astype(np.float32)
 
 def clip_feature(name, arr):
+    """
+    Clip perturbed feature to valid physical range.
+    """
     if name == "EVI.EVI":
-        return np.clip(arr, EVI_MIN, EVI_MAX)
+        return np.clip(arr, 0.0, 1.0)
+
     if name == "LAI.LAI":
-        return np.clip(arr, LAI_MIN, LAI_MAX)
+        return np.clip(arr, 0.0, 8.0)
+
     return arr
 
-def positive_deltas_by_1pct_steps(x, hi=0.95, pct_step=0.01, max_points=201):
-    x = np.asarray(x, dtype=float)
-    m = np.isfinite(x) & (x > 0)
-    if m.sum() == 0:
-        return np.array([0.0], dtype=np.float32)
 
-    mean_pos = float(np.mean(x[m]))
-    q_hi = float(np.quantile(x[m], hi))
-    max_inc = max(0.0, q_hi - mean_pos)
+def positive_deltas_by_1pct_steps(
+    x_series,
+    feat=None,
+    hi=0.95,
+    pct_step=0.01,
+    max_points=201,
+    evi_xmax=0.60
+):
+    """
+    Positive perturbation Δ.
+
+    EVI:
+        Δ from 0 to 0.60, so the EVI panel x-axis is extended to 0.6.
+
+    LAI:
+        Δ from 0 to Q95 - mean_pos, following your original logic.
+    """
+    x = x_series.to_numpy()
+    pos_mask = np.isfinite(x) & (x > 0)
+
+    if pos_mask.sum() == 0:
+        return np.array([0.0, 1e-3], dtype=np.float32)
+
+    mean_pos = float(np.mean(x[pos_mask]))
+    q_hi = float(np.quantile(x[pos_mask], hi))
+
+    if feat == "EVI.EVI":
+        max_inc = float(evi_xmax)
+    else:
+        max_inc = max(0.0, q_hi - mean_pos)
+
+    if max_inc <= 1e-8:
+        return np.array([0.0, 1e-4], dtype=np.float32)
 
     step = max(1e-6, pct_step * max(mean_pos, 1e-6))
-    if max_inc < step:
-        return np.array([0.0, max(1e-4, max_inc)], dtype=np.float32)
 
     n_steps = int(np.floor(max_inc / step)) + 1
     n_steps = min(n_steps, max_points)
-    return np.linspace(0.0, step * (n_steps - 1), n_steps, dtype=np.float32)
 
-def sample_subset(X, y, mask, max_n, seed):
-    idx = np.where(mask)[0]
-    if idx.size == 0:
-        return None, None, None
-    rng = np.random.default_rng(seed)
-    if max_n is not None and idx.size > max_n:
-        idx = rng.choice(idx, size=max_n, replace=False)
-    return X[idx].astype(np.float32), y[idx].astype(np.float32), idx
+    deltas = np.linspace(0.0, max_inc, n_steps, dtype=np.float32)
+    return deltas
 
-def bootstrap_ci_from_effects(effects, n_boot=500, ci=95, seed=42, chunk=50):
+
+def bootstrap_curve_ci(
+    response_matrix,
+    n_boot=200,
+    sample_size=10000,
+    ci_level=95,
+    random_state=42
+):
     """
-    effects: (N, D), per-sample response for each delta.
-    Returns mean, lower, upper.
-    Bootstrap is done on already-computed effects, so it is fast.
+    Bootstrap confidence interval for mean response curve.
+
+    response_matrix shape:
+        [n_delta, n_samples]
+
+    Each column is one sample's perturbation-response trajectory.
     """
-    effects = np.asarray(effects, dtype=np.float32)
-    N, D = effects.shape
+    n_delta, n_samples = response_matrix.shape
 
-    mean_curve = np.nanmean(effects, axis=0)
+    if n_samples == 0:
+        nan_arr = np.full(n_delta, np.nan, dtype=np.float32)
+        return nan_arr, nan_arr
 
-    rng = np.random.default_rng(seed)
-    boot_means = np.empty((n_boot, D), dtype=np.float32)
+    sample_size = min(sample_size, n_samples)
+    rng = np.random.default_rng(random_state)
 
-    done = 0
-    while done < n_boot:
-        b = min(chunk, n_boot - done)
-        idx = rng.integers(0, N, size=(b, N))
-        boot_means[done:done+b] = np.nanmean(effects[idx], axis=1)
-        done += b
+    boot_means = np.empty((n_boot, n_delta), dtype=np.float32)
 
-    alpha = (100 - ci) / 2
-    lo = np.nanpercentile(boot_means, alpha, axis=0)
-    hi = np.nanpercentile(boot_means, 100 - alpha, axis=0)
-    return mean_curve, lo, hi
+    for b in range(n_boot):
+        idx = rng.integers(0, n_samples, size=sample_size)
+        boot_means[b, :] = response_matrix[:, idx].mean(axis=1)
 
-def compute_effects_fast(model, X_sub, y_sub, feat_idx, feat_name, deltas, batch_deltas=8):
+    alpha = (100.0 - ci_level) / 2.0
+
+    lower = np.percentile(boot_means, alpha, axis=0).astype(np.float32)
+    upper = np.percentile(boot_means, 100.0 - alpha, axis=0).astype(np.float32)
+
+    return lower, upper
+
+
+def perturb_and_response_positive_with_ci(
+    model,
+    X_df,
+    feat,
+    deltas,
+    max_samples=100000,
+    n_boot=200,
+    bootstrap_sample_size=10000,
+    ci_level=95,
+    random_state=42
+):
     """
-    Computes both response definitions:
-    1) model_ref: pred_perturbed - pred_baseline
-    2) obs_ref:   pred_perturbed - observed_y
+    Fast perturbation-response calculation with bootstrap CI.
 
-    Returns:
-      effects_model_ref: (N,D)
-      effects_obs_ref:   (N,D)
-      pred_base:         (N,)
+    Core logic:
+    - Only use samples where baseline vegetation feature > 0.
+    - Randomly sample at most max_samples rows.
+    - Baseline = model prediction under original feature values.
+    - Response = pred_after_perturbation - pred_baseline.
+    - CI = bootstrap uncertainty of the mean response curve.
     """
-    X_sub = X_sub.astype(np.float32)
-    y_sub = y_sub.astype(np.float32)
-    N = X_sub.shape[0]
-    D = len(deltas)
+    if feat not in X_df.columns:
+        empty = np.array([], dtype=np.float32)
+        return empty, empty, empty, 0
 
-    pred_base = model.predict(X_sub).astype(np.float32)
+    feat_idx = X_df.columns.get_loc(feat)
+    x_feat = X_df[feat].to_numpy()
 
-    effects_model = np.empty((N, D), dtype=np.float32)
-    effects_obs = np.empty((N, D), dtype=np.float32)
+    base_mask = np.isfinite(x_feat) & (x_feat > 0)
 
-    for s in range(0, D, batch_deltas):
-        d_chunk = np.asarray(deltas[s:s+batch_deltas], dtype=np.float32)
-        B = len(d_chunk)
+    if not base_mask.any():
+        empty = np.array([], dtype=np.float32)
+        return empty, empty, empty, 0
 
-        X_big = np.repeat(X_sub, B, axis=0)
-        add_vals = np.tile(d_chunk, N)
-        X_big[:, feat_idx] = clip_feature(feat_name, X_big[:, feat_idx] + add_vals)
+    valid_idx = np.where(base_mask)[0]
 
-        pred = model.predict(X_big).astype(np.float32).reshape(N, B)
+    if len(valid_idx) > max_samples:
+        rng = np.random.default_rng(random_state)
+        valid_idx = rng.choice(valid_idx, size=max_samples, replace=False)
 
-        effects_model[:, s:s+B] = pred - pred_base[:, None]
-        effects_obs[:, s:s+B] = pred - y_sub[:, None]
+    # Convert to writable contiguous numpy array
+    X_base = X_df.iloc[valid_idx].to_numpy(dtype=np.float32, copy=True)
+    X_base = np.ascontiguousarray(X_base, dtype=np.float32)
 
-        del X_big, pred
-        gc.collect()
+    X_work = X_base.copy()
+    original_feat = X_base[:, feat_idx].copy()
 
-    return effects_model, effects_obs, pred_base
+    # Baseline prediction under original features
+    y0_pred = model.predict(X_base).astype(np.float32)
+
+    n_delta = len(deltas)
+    n_used = X_base.shape[0]
+
+    response_matrix = np.empty((n_delta, n_used), dtype=np.float32)
+
+    for k, d in enumerate(deltas):
+        X_work[:, feat_idx] = clip_feature(feat, original_feat + d).astype(np.float32)
+        y_pred = model.predict(X_work).astype(np.float32)
+        response_matrix[k, :] = y_pred - y0_pred
+
+    mean_curve = response_matrix.mean(axis=1).astype(np.float32)
+
+    lower_curve, upper_curve = bootstrap_curve_ci(
+        response_matrix=response_matrix,
+        n_boot=n_boot,
+        sample_size=bootstrap_sample_size,
+        ci_level=ci_level,
+        random_state=random_state
+    )
+
+    return mean_curve, lower_curve, upper_curve, int(n_used)
+
 
 def summarize_curve(deltas, response):
+    """
+    Summary metrics for perturbation-response curve:
+    - min_cooling: strongest cooling response, i.e., most negative ΔLST
+    - at_delta: Δ where strongest cooling occurs
+    - sat80_delta: minimum Δ reaching 80% of strongest cooling
+    - left_slope: initial slope
+    - right_slope: terminal slope
+    """
     out = {
         "min_cooling": np.nan,
         "at_delta": np.nan,
         "sat80_delta": np.nan,
         "left_slope": np.nan,
-        "right_slope": np.nan,
+        "right_slope": np.nan
     }
-    response = np.asarray(response, dtype=float)
-    deltas = np.asarray(deltas, dtype=float)
 
-    if response.size == 0 or deltas.size == 0 or not np.isfinite(response).any():
+    if response.size == 0 or deltas.size == 0:
+        return out
+
+    if np.all(~np.isfinite(response)):
         return out
 
     i_min = int(np.nanargmin(response))
+
     out["min_cooling"] = float(response[i_min])
     out["at_delta"] = float(deltas[i_min])
 
     target = 0.8 * response[i_min]
     sat_idx = np.where(response <= target)[0]
+
     if sat_idx.size:
         nearest = sat_idx[np.argmin(np.abs(deltas[sat_idx]))]
         out["sat80_delta"] = float(deltas[nearest])
 
-    if deltas.size >= 3 and deltas[1] != deltas[0] and deltas[-1] != deltas[-2]:
-        out["left_slope"] = float((response[1] - response[0]) / (deltas[1] - deltas[0]))
-        out["right_slope"] = float((response[-1] - response[-2]) / (deltas[-1] - deltas[-2]))
+    if deltas.size >= 3:
+        denom_left = deltas[1] - deltas[0]
+        denom_right = deltas[-1] - deltas[-2]
+
+        if abs(denom_left) > 1e-12:
+            out["left_slope"] = float((response[1] - response[0]) / denom_left)
+
+        if abs(denom_right) > 1e-12:
+            out["right_slope"] = float((response[-1] - response[-2]) / denom_right)
 
     return out
 
-# ============================================================
-# 4) Main analysis
-# ============================================================
-X_all = sanitize_veg_np(X_valid, channels)
-results = {}
-curve_tables = []
-
-for feat in veg_features:
-    print(f"\n==================== {feat} ====================")
-
-    feat_idx = channels.index(feat)
-    deltas = positive_deltas_by_1pct_steps(
-        X_all[:, feat_idx],
-        hi=Q_HI,
-        pct_step=PCT_STEP,
-        max_points=DELTA_MAX_POINTS,
-    )
-
-    results[feat] = {}
-
-    for subset_name, mask in subsets.items():
-        X_sub, y_sub, sample_idx = sample_subset(
-            X_all, y_valid, mask,
-            max_n=MAX_SAMPLES_PER_SUBSET,
-            seed=RANDOM_SEED + abs(hash((feat, subset_name))) % 10000,
-        )
-
-        if X_sub is None:
-            continue
-
-        # Only perturb baseline > 0 samples
-        base_feat = X_sub[:, feat_idx]
-        m_pos = np.isfinite(base_feat) & (base_feat > 0)
-        X_sub = X_sub[m_pos]
-        y_sub = y_sub[m_pos]
-
-        print(f"[{subset_name}] N used={X_sub.shape[0]}, D={len(deltas)}")
-
-        effects_model, effects_obs, pred_base = compute_effects_fast(
-            model=model,
-            X_sub=X_sub,
-            y_sub=y_sub,
-            feat_idx=feat_idx,
-            feat_name=feat,
-            deltas=deltas,
-            batch_deltas=PREDICT_BATCH_DELTAS,
-        )
-
-        # Bootstrap CI from effects, no repeated model prediction
-        mean_model, lo_model, hi_model = bootstrap_ci_from_effects(
-            effects_model,
-            n_boot=BOOTSTRAP_N,
-            ci=CI_LEVEL,
-            seed=RANDOM_SEED + 1,
-            chunk=BOOTSTRAP_CHUNK,
-        )
-
-        mean_obs, lo_obs, hi_obs = bootstrap_ci_from_effects(
-            effects_obs,
-            n_boot=BOOTSTRAP_N,
-            ci=CI_LEVEL,
-            seed=RANDOM_SEED + 2,
-            chunk=BOOTSTRAP_CHUNK,
-        )
-
-        # Diagnostic baseline bias
-        baseline_bias = float(np.nanmean(pred_base - y_sub))
-        baseline_rmse = float(np.sqrt(np.nanmean((pred_base - y_sub) ** 2)))
-        baseline_mae = float(np.nanmean(np.abs(pred_base - y_sub)))
-
-        results[feat][subset_name] = {
-            "n_used": int(X_sub.shape[0]),
-            "n_deltas": int(len(deltas)),
-            "baseline_bias_pred_minus_obs": baseline_bias,
-            "baseline_rmse": baseline_rmse,
-            "baseline_mae": baseline_mae,
-            "model_ref_summary": summarize_curve(deltas, mean_model),
-            "obs_ref_summary": summarize_curve(deltas, mean_obs),
-        }
-
-        for k, d in enumerate(deltas):
-            curve_tables.append({
-                "feature": feat,
-                "subset": subset_name,
-                "delta": float(d),
-
-                "model_ref_mean": float(mean_model[k]),
-                "model_ref_lo": float(lo_model[k]),
-                "model_ref_hi": float(hi_model[k]),
-
-                "obs_ref_mean": float(mean_obs[k]),
-                "obs_ref_lo": float(lo_obs[k]),
-                "obs_ref_hi": float(hi_obs[k]),
-
-                "baseline_bias_pred_minus_obs": baseline_bias,
-                "baseline_rmse": baseline_rmse,
-                "baseline_mae": baseline_mae,
-                "n_used": int(X_sub.shape[0]),
-            })
-
-        del effects_model, effects_obs, pred_base, X_sub, y_sub
-        gc.collect()
 
 # ============================================================
-# 5) Save source data
+# Paper-style plotting parameters
 # ============================================================
-df_curves = pd.DataFrame(curve_tables)
-csv_out = os.path.join(OUT_DIR, "veg_sensitivity_fast_dual_baseline_curves.csv")
-json_out = os.path.join(OUT_DIR, "veg_sensitivity_fast_dual_baseline_summary.json")
 
-df_curves.to_csv(csv_out, index=False)
-with open(json_out, "w", encoding="utf-8") as f:
-    json.dump(results, f, indent=2, ensure_ascii=False)
-
-print("\n✅ Saved curve source data:", csv_out)
-print("✅ Saved summary:", json_out)
-
-# ============================================================
-# 6) Plot
-# ============================================================
 plt.rcParams.update({
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "axes.linewidth": 1.1,
-    "font.size": 10,
+    "axes.linewidth": 1.2,
+    "font.size": 11,
+    "legend.frameon": False
 })
 
-for ref_type, ycols, title_suffix in [
-    ("model_ref", ("model_ref_mean", "model_ref_lo", "model_ref_hi"),
-     "Model-referenced response: pred(perturbed) - pred(baseline)"),
-    ("obs_ref", ("obs_ref_mean", "obs_ref_lo", "obs_ref_hi"),
-     "Observation-referenced response: pred(perturbed) - observed LST"),
-]:
-    n = len(veg_features)
-    fig, axes = plt.subplots(1, n, figsize=(6.2 * n, 4.8), squeeze=False)
-    axes = axes.flatten()
+style_map = {
+    "All": dict(
+        color="black",
+        linewidth=2.5,
+        linestyle="-"
+    ),
+    "High Temp (≥P80)": dict(
+        color="#d62728",
+        linewidth=2.0,
+        linestyle="--"
+    ),
+    "Mid Temp ([P60,P80))": dict(
+        color="#1f77b4",
+        linewidth=2.0,
+        linestyle="-."
+    )
+}
 
-    for i, feat in enumerate(veg_features):
-        ax = axes[i]
-        sub_feat = df_curves[df_curves["feature"] == feat]
 
-        for subset_name in subsets.keys():
-            sub = sub_feat[sub_feat["subset"] == subset_name].sort_values("delta")
-            if sub.empty:
-                continue
+# ============================================================
+# Plotting and measurement
+# ============================================================
 
-            style = style_map.get(subset_name, dict(linewidth=2.0))
-            color = style.get("color", None)
+results = {}
 
-            ax.plot(sub["delta"], sub[ycols[0]], label=subset_name, **style)
-            ax.fill_between(
-                sub["delta"].values,
-                sub[ycols[1]].values,
-                sub[ycols[2]].values,
-                alpha=0.15,
-                color=color,
-                linewidth=0,
+n = len(veg_features)
+ncols = 2
+nrows = int(np.ceil(n / ncols))
+
+fig, axes = plt.subplots(
+    nrows,
+    ncols,
+    figsize=(6 * ncols, 5 * nrows)
+)
+
+axes = np.atleast_1d(axes).flatten()
+
+for i, feat in enumerate(veg_features):
+    print(f"\nProcessing feature: {feat}")
+
+    ax = axes[i]
+
+    # ------------------------------------------------------------
+    # EVI: Δ extends to 0.6
+    # LAI: Δ uses Q95 - mean_pos
+    # ------------------------------------------------------------
+    deltas = positive_deltas_by_1pct_steps(
+        Xv[feat],
+        feat=feat,
+        hi=Q_HI,
+        pct_step=PCT_STEP,
+        max_points=MAX_DELTA_POINTS,
+        evi_xmax=EVI_XMAX
+    )
+
+    print(f"  Number of delta points: {len(deltas)}")
+    print(f"  Delta range: {float(deltas.min()):.5f} to {float(deltas.max()):.5f}")
+
+    curves = {}
+    ci_lower = {}
+    ci_upper = {}
+    n_used_dict = {}
+
+    for j, (name, mask) in enumerate(subsets.items()):
+        print(f"  Running subset: {name}")
+
+        X_sub = Xv.loc[mask]
+
+        mean_curve, lower_curve, upper_curve, n_used = perturb_and_response_positive_with_ci(
+            model=model,
+            X_df=X_sub,
+            feat=feat,
+            deltas=deltas,
+            max_samples=MAX_SAMPLES_PER_SUBSET,
+            n_boot=N_BOOTSTRAP,
+            bootstrap_sample_size=BOOTSTRAP_SAMPLE_SIZE,
+            ci_level=CI_LEVEL,
+            random_state=RANDOM_STATE + i * 100 + j
+        )
+
+        curves[name] = mean_curve
+        ci_lower[name] = lower_curve
+        ci_upper[name] = upper_curve
+        n_used_dict[name] = n_used
+
+        print(f"    samples used: {n_used}")
+
+        if mean_curve.size:
+            print(
+                f"    response range: "
+                f"{float(np.nanmin(mean_curve)):.4f} to {float(np.nanmax(mean_curve)):.4f}"
             )
 
-        ax.axhline(0, color="gray", linestyle=":", linewidth=1.0)
-        ax.set_title(feat)
-        ax.set_xlabel(f"{feat} positive perturbation")
-        ax.set_ylabel("Delta predicted LST (C)")
+    # ------------------------------------------------------------
+    # Plot response curves + CI
+    # Keep your original plotting style:
+    # - line curves
+    # - no background grid
+    # - density histogram on right axis
+    # ------------------------------------------------------------
+    for name, resp in curves.items():
+        if resp.size:
+            style = style_map.get(name, {})
 
-        # histogram
-        ax2 = ax.twinx()
-        vals = X_all[:, channels.index(feat)]
-        vals = vals[np.isfinite(vals) & (vals > 0)]
-        if vals.size:
-            ax2.hist(vals, bins=35, alpha=0.12, density=True, color="gray")
-        ax2.set_ylabel("Density", color="gray")
-        ax2.tick_params(axis="y", labelcolor="gray")
+            line = ax.plot(
+                deltas,
+                resp,
+                label=name,
+                **style
+            )[0]
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
-    fig.suptitle(title_suffix, y=1.03, fontsize=13)
-    plt.tight_layout()
+            color = line.get_color()
 
-    fig_out = os.path.join(OUT_DIR, f"veg_sensitivity_{ref_type}.png")
-    plt.savefig(fig_out, dpi=300, bbox_inches="tight")
-    plt.show()
+            ax.fill_between(
+                deltas,
+                ci_lower[name],
+                ci_upper[name],
+                color=color,
+                alpha=0.14,
+                linewidth=0
+            )
 
-    print("✅ Saved figure:", fig_out)
+    ax.axhline(
+        0,
+        color="gray",
+        linestyle=":",
+        linewidth=1
+    )
+
+    ax.set_title(
+        f"Sensitivity of {feat} (Positive Δ @ 1% steps of mean>0)",
+        fontsize=12
+    )
+
+    ax.set_xlabel(f"{feat} positive perturbation (Δ ≥ 0)")
+    ax.set_ylabel("Δ Predicted LST (°C)")
+
+    # No background grid
+    ax.grid(False)
+
+    # EVI x-axis fixed to 0.6
+    if feat == "EVI.EVI":
+        ax.set_xlim(0, 1)
+
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=3,
+        frameon=False
+    )
+
+    # ------------------------------------------------------------
+    # Keep density histogram on the right axis
+    # ------------------------------------------------------------
+    ax2 = ax.twinx()
+
+    vals = Xv[feat].to_numpy()
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+
+    if vals.size:
+        ax2.hist(
+            vals,
+            bins=30,
+            alpha=0.18,
+            density=True,
+            color="#9ecae1"
+        )
+
+    ax2.set_ylabel("Density", color="gray")
+    ax2.tick_params(axis="y", labelcolor="gray")
+    ax2.grid(False)
+
+    # ------------------------------------------------------------
+    # Save statistics
+    # ------------------------------------------------------------
+    results[feat] = {}
+
+    for name, resp in curves.items():
+        summary = summarize_curve(deltas, resp)
+
+        summary["n_used"] = int(n_used_dict[name])
+        summary["n_delta"] = int(len(deltas))
+        summary["delta_min"] = float(np.nanmin(deltas))
+        summary["delta_max"] = float(np.nanmax(deltas))
+        summary["n_bootstrap"] = int(N_BOOTSTRAP)
+        summary["bootstrap_sample_size"] = int(
+            min(BOOTSTRAP_SAMPLE_SIZE, max(n_used_dict[name], 1))
+        )
+
+        results[feat][name] = {
+            "summary": summary,
+            "deltas": deltas.tolist(),
+            "mean_curve": resp.tolist(),
+            "ci_lower": ci_lower[name].tolist(),
+            "ci_upper": ci_upper[name].tolist()
+        }
+
+
+# Remove unused axes
+for j in range(i + 1, len(axes)):
+    fig.delaxes(axes[j])
+
+
+plt.suptitle(
+    "EVI/LAI Sensitivity "
+    f"(Positive Perturbation, 1% Steps of Mean>0, {CI_LEVEL}% Bootstrap CI)",
+    fontsize=14
+)
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+# Save figure
+out_fig = os.path.join(MODEL_DIR, OUT_FIG_NAME)
+plt.savefig(out_fig, dpi=300, bbox_inches="tight")
+
+plt.show()
+
+print("✅ 已保存图片：", out_fig)
+
 
 # ============================================================
-# 7) Print key summaries
+# Export statistics
 # ============================================================
+
+out_json = os.path.join(MODEL_DIR, OUT_JSON_NAME)
+
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+
+print("✅ 已导出统计量：", out_json)
+
+
+# ============================================================
+# Print summary
+# ============================================================
+
 for feat in veg_features:
     print(f"\n== {feat} ==")
-    for subset_name in subsets.keys():
-        if subset_name not in results[feat]:
-            continue
-        r = results[feat][subset_name]
-        ms = r["model_ref_summary"]
-        osum = r["obs_ref_summary"]
-        print(f"  [{subset_name}] N={r['n_used']} | bias={r['baseline_bias_pred_minus_obs']:.3f}, RMSE={r['baseline_rmse']:.3f}")
-        print(
-            f"    model_ref: min={ms['min_cooling']:.3f} C @ delta={ms['at_delta']:.4f}, "
-            f"sat80={ms['sat80_delta']:.4f}, slopes=({ms['left_slope']:.3f},{ms['right_slope']:.3f})"
-        )
-        print(
-            f"    obs_ref:   min={osum['min_cooling']:.3f} C @ delta={osum['at_delta']:.4f}, "
-            f"sat80={osum['sat80_delta']:.4f}, slopes=({osum['left_slope']:.3f},{osum['right_slope']:.3f})"
-        )
+
+    for name in ["All", "High Temp (≥P80)", "Mid Temp ([P60,P80))"]:
+        if name in results[feat]:
+            r = results[feat][name]["summary"]
+
+            print(
+                f"  [{name}] "
+                f"n={r['n_used']} | "
+                f"min_cooling={r['min_cooling']:.3f} °C @ Δ={r['at_delta']:.4f} | "
+                f"sat80Δ={r['sat80_delta']:.4f} | "
+                f"slopes=({r['left_slope']:.3f},{r['right_slope']:.3f}) | "
+                f"delta_range=({r['delta_min']:.4f},{r['delta_max']:.4f}) | "
+                f"bootstrap={r['n_bootstrap']} × {r['bootstrap_sample_size']}"
+            )
