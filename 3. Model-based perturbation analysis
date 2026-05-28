@@ -1,0 +1,429 @@
+# -*- coding: utf-8 -*-
+import os, json, gc
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+# ============================================================
+# 0) Paths
+# ============================================================
+MODEL_DIR = "/content/drive/MyDrive/anature_revised/Trainmodel/"
+
+model_path    = os.path.join(MODEL_DIR, "catboost_model.cbm")
+channels_path = os.path.join(MODEL_DIR, "channels.npy")
+X_valid_path  = os.path.join(MODEL_DIR, "X_valid.npy")
+y_valid_path  = os.path.join(MODEL_DIR, "y_valid.npy")
+
+OUT_DIR = os.path.join(MODEL_DIR, "veg_sensitivity_fast_dual_baseline")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+assert os.path.exists(model_path)
+assert os.path.exists(channels_path)
+assert os.path.exists(X_valid_path)
+assert os.path.exists(y_valid_path)
+
+# ============================================================
+# 1) Load
+# ============================================================
+model = CatBoostRegressor()
+model.load_model(model_path)
+
+channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
+X_valid = np.load(X_valid_path).astype(np.float32)
+y_valid = np.load(y_valid_path).astype(np.float32)
+
+Xv = pd.DataFrame(X_valid, columns=channels)
+
+veg_features = [f for f in ["EVI.EVI", "LAI.LAI"] if f in Xv.columns]
+assert veg_features, "No EVI.EVI / LAI.LAI in validation features."
+
+# ============================================================
+# 2) Settings
+# ============================================================
+RANDOM_SEED = 42
+
+# Speed knobs
+MAX_SAMPLES_PER_SUBSET = 80000     # final可设 100000-200000；测试设 20000
+PREDICT_BATCH_DELTAS = 8           # 每次同时预测几个delta，太大容易爆内存
+BOOTSTRAP_N = 500                  # 由于不再重复预测，可以提高到500/1000
+CI_LEVEL = 95
+BOOTSTRAP_CHUNK = 50               # bootstrap分块，避免一次生成巨大idx矩阵
+
+# Perturbation range
+DELTA_MAX_POINTS = 201
+PCT_STEP = 0.01
+Q_HI = 0.95
+
+# Optional empirical cap
+EVI_MIN, EVI_MAX = 0.0, 1.0
+LAI_MIN, LAI_MAX = 0.0, 8.0
+
+# Subsets
+q80 = np.nanquantile(y_valid, 0.80)
+q60 = np.nanquantile(y_valid, 0.60)
+
+subsets = {
+    "All": np.ones_like(y_valid, dtype=bool),
+    "High Temp (>=P80)": y_valid >= q80,
+    "Mid Temp ([P60,P80))": (y_valid < q80) & (y_valid >= q60),
+}
+
+style_map = {
+    "All": dict(color="black", linewidth=2.5, linestyle="-"),
+    "High Temp (>=P80)": dict(color="#d62728", linewidth=2.0, linestyle="--"),
+    "Mid Temp ([P60,P80))": dict(color="#1f77b4", linewidth=2.0, linestyle="-."),
+}
+
+rng_global = np.random.default_rng(RANDOM_SEED)
+
+# ============================================================
+# 3) Utilities
+# ============================================================
+def sanitize_veg_np(X, cols):
+    X = X.copy()
+    if "EVI.EVI" in cols:
+        j = cols.index("EVI.EVI")
+        x = X[:, j]
+        x = np.nan_to_num(x, nan=0.0)
+        X[:, j] = np.clip(x, EVI_MIN, EVI_MAX)
+    if "LAI.LAI" in cols:
+        j = cols.index("LAI.LAI")
+        x = X[:, j]
+        x = np.nan_to_num(x, nan=0.0)
+        X[:, j] = np.clip(x, LAI_MIN, LAI_MAX)
+    return X.astype(np.float32)
+
+def clip_feature(name, arr):
+    if name == "EVI.EVI":
+        return np.clip(arr, EVI_MIN, EVI_MAX)
+    if name == "LAI.LAI":
+        return np.clip(arr, LAI_MIN, LAI_MAX)
+    return arr
+
+def positive_deltas_by_1pct_steps(x, hi=0.95, pct_step=0.01, max_points=201):
+    x = np.asarray(x, dtype=float)
+    m = np.isfinite(x) & (x > 0)
+    if m.sum() == 0:
+        return np.array([0.0], dtype=np.float32)
+
+    mean_pos = float(np.mean(x[m]))
+    q_hi = float(np.quantile(x[m], hi))
+    max_inc = max(0.0, q_hi - mean_pos)
+
+    step = max(1e-6, pct_step * max(mean_pos, 1e-6))
+    if max_inc < step:
+        return np.array([0.0, max(1e-4, max_inc)], dtype=np.float32)
+
+    n_steps = int(np.floor(max_inc / step)) + 1
+    n_steps = min(n_steps, max_points)
+    return np.linspace(0.0, step * (n_steps - 1), n_steps, dtype=np.float32)
+
+def sample_subset(X, y, mask, max_n, seed):
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        return None, None, None
+    rng = np.random.default_rng(seed)
+    if max_n is not None and idx.size > max_n:
+        idx = rng.choice(idx, size=max_n, replace=False)
+    return X[idx].astype(np.float32), y[idx].astype(np.float32), idx
+
+def bootstrap_ci_from_effects(effects, n_boot=500, ci=95, seed=42, chunk=50):
+    """
+    effects: (N, D), per-sample response for each delta.
+    Returns mean, lower, upper.
+    Bootstrap is done on already-computed effects, so it is fast.
+    """
+    effects = np.asarray(effects, dtype=np.float32)
+    N, D = effects.shape
+
+    mean_curve = np.nanmean(effects, axis=0)
+
+    rng = np.random.default_rng(seed)
+    boot_means = np.empty((n_boot, D), dtype=np.float32)
+
+    done = 0
+    while done < n_boot:
+        b = min(chunk, n_boot - done)
+        idx = rng.integers(0, N, size=(b, N))
+        boot_means[done:done+b] = np.nanmean(effects[idx], axis=1)
+        done += b
+
+    alpha = (100 - ci) / 2
+    lo = np.nanpercentile(boot_means, alpha, axis=0)
+    hi = np.nanpercentile(boot_means, 100 - alpha, axis=0)
+    return mean_curve, lo, hi
+
+def compute_effects_fast(model, X_sub, y_sub, feat_idx, feat_name, deltas, batch_deltas=8):
+    """
+    Computes both response definitions:
+    1) model_ref: pred_perturbed - pred_baseline
+    2) obs_ref:   pred_perturbed - observed_y
+
+    Returns:
+      effects_model_ref: (N,D)
+      effects_obs_ref:   (N,D)
+      pred_base:         (N,)
+    """
+    X_sub = X_sub.astype(np.float32)
+    y_sub = y_sub.astype(np.float32)
+    N = X_sub.shape[0]
+    D = len(deltas)
+
+    pred_base = model.predict(X_sub).astype(np.float32)
+
+    effects_model = np.empty((N, D), dtype=np.float32)
+    effects_obs = np.empty((N, D), dtype=np.float32)
+
+    for s in range(0, D, batch_deltas):
+        d_chunk = np.asarray(deltas[s:s+batch_deltas], dtype=np.float32)
+        B = len(d_chunk)
+
+        X_big = np.repeat(X_sub, B, axis=0)
+        add_vals = np.tile(d_chunk, N)
+        X_big[:, feat_idx] = clip_feature(feat_name, X_big[:, feat_idx] + add_vals)
+
+        pred = model.predict(X_big).astype(np.float32).reshape(N, B)
+
+        effects_model[:, s:s+B] = pred - pred_base[:, None]
+        effects_obs[:, s:s+B] = pred - y_sub[:, None]
+
+        del X_big, pred
+        gc.collect()
+
+    return effects_model, effects_obs, pred_base
+
+def summarize_curve(deltas, response):
+    out = {
+        "min_cooling": np.nan,
+        "at_delta": np.nan,
+        "sat80_delta": np.nan,
+        "left_slope": np.nan,
+        "right_slope": np.nan,
+    }
+    response = np.asarray(response, dtype=float)
+    deltas = np.asarray(deltas, dtype=float)
+
+    if response.size == 0 or deltas.size == 0 or not np.isfinite(response).any():
+        return out
+
+    i_min = int(np.nanargmin(response))
+    out["min_cooling"] = float(response[i_min])
+    out["at_delta"] = float(deltas[i_min])
+
+    target = 0.8 * response[i_min]
+    sat_idx = np.where(response <= target)[0]
+    if sat_idx.size:
+        nearest = sat_idx[np.argmin(np.abs(deltas[sat_idx]))]
+        out["sat80_delta"] = float(deltas[nearest])
+
+    if deltas.size >= 3 and deltas[1] != deltas[0] and deltas[-1] != deltas[-2]:
+        out["left_slope"] = float((response[1] - response[0]) / (deltas[1] - deltas[0]))
+        out["right_slope"] = float((response[-1] - response[-2]) / (deltas[-1] - deltas[-2]))
+
+    return out
+
+# ============================================================
+# 4) Main analysis
+# ============================================================
+X_all = sanitize_veg_np(X_valid, channels)
+results = {}
+curve_tables = []
+
+for feat in veg_features:
+    print(f"\n==================== {feat} ====================")
+
+    feat_idx = channels.index(feat)
+    deltas = positive_deltas_by_1pct_steps(
+        X_all[:, feat_idx],
+        hi=Q_HI,
+        pct_step=PCT_STEP,
+        max_points=DELTA_MAX_POINTS,
+    )
+
+    results[feat] = {}
+
+    for subset_name, mask in subsets.items():
+        X_sub, y_sub, sample_idx = sample_subset(
+            X_all, y_valid, mask,
+            max_n=MAX_SAMPLES_PER_SUBSET,
+            seed=RANDOM_SEED + abs(hash((feat, subset_name))) % 10000,
+        )
+
+        if X_sub is None:
+            continue
+
+        # Only perturb baseline > 0 samples
+        base_feat = X_sub[:, feat_idx]
+        m_pos = np.isfinite(base_feat) & (base_feat > 0)
+        X_sub = X_sub[m_pos]
+        y_sub = y_sub[m_pos]
+
+        print(f"[{subset_name}] N used={X_sub.shape[0]}, D={len(deltas)}")
+
+        effects_model, effects_obs, pred_base = compute_effects_fast(
+            model=model,
+            X_sub=X_sub,
+            y_sub=y_sub,
+            feat_idx=feat_idx,
+            feat_name=feat,
+            deltas=deltas,
+            batch_deltas=PREDICT_BATCH_DELTAS,
+        )
+
+        # Bootstrap CI from effects, no repeated model prediction
+        mean_model, lo_model, hi_model = bootstrap_ci_from_effects(
+            effects_model,
+            n_boot=BOOTSTRAP_N,
+            ci=CI_LEVEL,
+            seed=RANDOM_SEED + 1,
+            chunk=BOOTSTRAP_CHUNK,
+        )
+
+        mean_obs, lo_obs, hi_obs = bootstrap_ci_from_effects(
+            effects_obs,
+            n_boot=BOOTSTRAP_N,
+            ci=CI_LEVEL,
+            seed=RANDOM_SEED + 2,
+            chunk=BOOTSTRAP_CHUNK,
+        )
+
+        # Diagnostic baseline bias
+        baseline_bias = float(np.nanmean(pred_base - y_sub))
+        baseline_rmse = float(np.sqrt(np.nanmean((pred_base - y_sub) ** 2)))
+        baseline_mae = float(np.nanmean(np.abs(pred_base - y_sub)))
+
+        results[feat][subset_name] = {
+            "n_used": int(X_sub.shape[0]),
+            "n_deltas": int(len(deltas)),
+            "baseline_bias_pred_minus_obs": baseline_bias,
+            "baseline_rmse": baseline_rmse,
+            "baseline_mae": baseline_mae,
+            "model_ref_summary": summarize_curve(deltas, mean_model),
+            "obs_ref_summary": summarize_curve(deltas, mean_obs),
+        }
+
+        for k, d in enumerate(deltas):
+            curve_tables.append({
+                "feature": feat,
+                "subset": subset_name,
+                "delta": float(d),
+
+                "model_ref_mean": float(mean_model[k]),
+                "model_ref_lo": float(lo_model[k]),
+                "model_ref_hi": float(hi_model[k]),
+
+                "obs_ref_mean": float(mean_obs[k]),
+                "obs_ref_lo": float(lo_obs[k]),
+                "obs_ref_hi": float(hi_obs[k]),
+
+                "baseline_bias_pred_minus_obs": baseline_bias,
+                "baseline_rmse": baseline_rmse,
+                "baseline_mae": baseline_mae,
+                "n_used": int(X_sub.shape[0]),
+            })
+
+        del effects_model, effects_obs, pred_base, X_sub, y_sub
+        gc.collect()
+
+# ============================================================
+# 5) Save source data
+# ============================================================
+df_curves = pd.DataFrame(curve_tables)
+csv_out = os.path.join(OUT_DIR, "veg_sensitivity_fast_dual_baseline_curves.csv")
+json_out = os.path.join(OUT_DIR, "veg_sensitivity_fast_dual_baseline_summary.json")
+
+df_curves.to_csv(csv_out, index=False)
+with open(json_out, "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+
+print("\n✅ Saved curve source data:", csv_out)
+print("✅ Saved summary:", json_out)
+
+# ============================================================
+# 6) Plot
+# ============================================================
+plt.rcParams.update({
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.linewidth": 1.1,
+    "font.size": 10,
+})
+
+for ref_type, ycols, title_suffix in [
+    ("model_ref", ("model_ref_mean", "model_ref_lo", "model_ref_hi"),
+     "Model-referenced response: pred(perturbed) - pred(baseline)"),
+    ("obs_ref", ("obs_ref_mean", "obs_ref_lo", "obs_ref_hi"),
+     "Observation-referenced response: pred(perturbed) - observed LST"),
+]:
+    n = len(veg_features)
+    fig, axes = plt.subplots(1, n, figsize=(6.2 * n, 4.8), squeeze=False)
+    axes = axes.flatten()
+
+    for i, feat in enumerate(veg_features):
+        ax = axes[i]
+        sub_feat = df_curves[df_curves["feature"] == feat]
+
+        for subset_name in subsets.keys():
+            sub = sub_feat[sub_feat["subset"] == subset_name].sort_values("delta")
+            if sub.empty:
+                continue
+
+            style = style_map.get(subset_name, dict(linewidth=2.0))
+            color = style.get("color", None)
+
+            ax.plot(sub["delta"], sub[ycols[0]], label=subset_name, **style)
+            ax.fill_between(
+                sub["delta"].values,
+                sub[ycols[1]].values,
+                sub[ycols[2]].values,
+                alpha=0.15,
+                color=color,
+                linewidth=0,
+            )
+
+        ax.axhline(0, color="gray", linestyle=":", linewidth=1.0)
+        ax.set_title(feat)
+        ax.set_xlabel(f"{feat} positive perturbation")
+        ax.set_ylabel("Delta predicted LST (C)")
+
+        # histogram
+        ax2 = ax.twinx()
+        vals = X_all[:, channels.index(feat)]
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        if vals.size:
+            ax2.hist(vals, bins=35, alpha=0.12, density=True, color="gray")
+        ax2.set_ylabel("Density", color="gray")
+        ax2.tick_params(axis="y", labelcolor="gray")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+    fig.suptitle(title_suffix, y=1.03, fontsize=13)
+    plt.tight_layout()
+
+    fig_out = os.path.join(OUT_DIR, f"veg_sensitivity_{ref_type}.png")
+    plt.savefig(fig_out, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    print("✅ Saved figure:", fig_out)
+
+# ============================================================
+# 7) Print key summaries
+# ============================================================
+for feat in veg_features:
+    print(f"\n== {feat} ==")
+    for subset_name in subsets.keys():
+        if subset_name not in results[feat]:
+            continue
+        r = results[feat][subset_name]
+        ms = r["model_ref_summary"]
+        osum = r["obs_ref_summary"]
+        print(f"  [{subset_name}] N={r['n_used']} | bias={r['baseline_bias_pred_minus_obs']:.3f}, RMSE={r['baseline_rmse']:.3f}")
+        print(
+            f"    model_ref: min={ms['min_cooling']:.3f} C @ delta={ms['at_delta']:.4f}, "
+            f"sat80={ms['sat80_delta']:.4f}, slopes=({ms['left_slope']:.3f},{ms['right_slope']:.3f})"
+        )
+        print(
+            f"    obs_ref:   min={osum['min_cooling']:.3f} C @ delta={osum['at_delta']:.4f}, "
+            f"sat80={osum['sat80_delta']:.4f}, slopes=({osum['left_slope']:.3f},{osum['right_slope']:.3f})"
+        )
